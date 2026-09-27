@@ -4,6 +4,9 @@
     Button,
     Checkbox,
     InlineNotification,
+    Modal,
+    RadioButton,
+    RadioButtonGroup,
     Select,
     SelectItem,
     Tag,
@@ -13,7 +16,7 @@
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
-  type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
+  type ViewMode = 'compose' | 'path' | 'issues' | 'versions' | 'cabinet';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
 
@@ -41,13 +44,29 @@
 
   interface Course {
     id: string;
+    seq: number;
     title: string;
+    className: string;
     level: string;
     ageRange: string;
     objective: string;
     activities: Activity[];
     versions: CourseVersion[];
     updatedAt: string;
+  }
+
+  interface CabinetEntry {
+    id: string;
+    seq: number;
+    title: string;
+    className: string;
+    updatedAt: string;
+  }
+
+  interface CabinetIndex {
+    activeId: string;
+    nextSeq: number;
+    entries: CabinetEntry[];
   }
 
   interface Diagnostic {
@@ -66,14 +85,19 @@
     detail: string;
   }
 
-  const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const CABINET_KEY = 'sologsb-1026-phonics-cabinet-v1';
+  const LEGACY_COURSE_KEY = 'sologsb-1026-phonics-course-v1';
+  const COURSE_KEY_PREFIX = 'sologsb-1026-phonics-course-';
+  const courseStorageKey = (id: string): string => `${COURSE_KEY_PREFIX}${id}`;
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
 
   const initialCourse = (): Course => ({
     id: 'course-phonics-1',
+    seq: 1,
     title: 'Starter Phonics · 声音侦探',
+    className: '向日葵班',
     level: '启蒙一级',
     ageRange: '5–6 岁',
     objective: '建立音素意识，能听辨、拼读并书写短元音单词。',
@@ -158,6 +182,7 @@
   });
 
   let course: Course = initialCourse();
+  let cabinet: CabinetIndex = { activeId: course.id, nextSeq: 2, entries: [] };
   let selectedActivityId = course.activities[0]?.id ?? '';
   let activeView: ViewMode = 'compose';
   let previewWidth: PreviewWidth = 'desktop';
@@ -172,6 +197,9 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let removeModalOpen = false;
+  let removeTargetId = '';
+  let removeNextId = '';
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
@@ -179,21 +207,27 @@
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: sortedEntries = [...cabinet.entries].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  $: removeTarget = cabinet.entries.find((entry) => entry.id === removeTargetId) ?? null;
+  $: removeAlternatives = cabinet.entries.filter((entry) => entry.id !== removeTargetId);
+  $: removePrimaryText = removeTargetId === cabinet.activeId
+    ? (removeAlternatives.length ? '移除并切换到所选课程' : '移除并新建空白课程')
+    : '移除课程';
 
   onMount(() => {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      try {
-        course = migrateCourse(JSON.parse(stored) as Course);
-        selectedActivityId = course.activities[0]?.id ?? '';
-        compareBaseId = course.versions[0]?.id ?? '';
-        compareTargetId = course.versions.at(-1)?.id ?? '';
-        savedLabel = `已恢复 · ${formatTime(course.updatedAt)}`;
-      } catch {
-        localStorage.removeItem(STORAGE_KEY);
-      }
+    const restored = restoreCabinet();
+    if (restored) {
+      cabinet = restored.index;
+      activateCourse(restored.course);
+      savedLabel = `已恢复 · ${formatTime(restored.course.updatedAt)}`;
+    } else {
+      const first = initialCourse();
+      cabinet = { activeId: first.id, nextSeq: first.seq + 1, entries: [entryOf(first)] };
+      activateCourse(first);
+      savedLabel = '已创建本地课程';
     }
     hydrated = true;
+    persist();
     const updateNetwork = () => {
       online = navigator.onLine;
       showOfflineNotice = !online;
@@ -207,9 +241,39 @@
     };
   });
 
+  function restoreCabinet(): { index: CabinetIndex; course: Course } | null {
+    try {
+      const rawIndex = localStorage.getItem(CABINET_KEY);
+      if (rawIndex) {
+        const index = JSON.parse(rawIndex) as CabinetIndex;
+        if (!index || !Array.isArray(index.entries)) return null;
+        index.entries = index.entries.filter((entry) => localStorage.getItem(courseStorageKey(entry.id)) !== null);
+        if (!index.entries.length) return null;
+        index.nextSeq = Math.max(Number(index.nextSeq) || 1, ...index.entries.map((entry) => (entry.seq || 0) + 1));
+        const activeId = index.entries.some((entry) => entry.id === index.activeId) ? index.activeId : index.entries[0].id;
+        const restored = loadCourseById(activeId);
+        if (!restored) return null;
+        index.activeId = activeId;
+        return { index, course: restored };
+      }
+      const legacy = localStorage.getItem(LEGACY_COURSE_KEY);
+      if (legacy) {
+        const migrated = migrateCourse(JSON.parse(legacy) as Course);
+        migrated.seq = 1;
+        localStorage.removeItem(LEGACY_COURSE_KEY);
+        return { index: { activeId: migrated.id, nextSeq: 2, entries: [entryOf(migrated)] }, course: migrated };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   function migrateCourse(value: Course): Course {
-    if (!value.id || !Array.isArray(value.activities)) return initialCourse();
+    if (!value || !value.id || !Array.isArray(value.activities)) return initialCourse();
     value.versions ??= [];
+    value.className ??= '';
+    value.seq ??= 1;
     return value;
   }
 
@@ -225,8 +289,130 @@
 
   function persist(): void {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
+    localStorage.setItem(courseStorageKey(course.id), JSON.stringify(course));
+    cabinet = {
+      ...cabinet,
+      entries: cabinet.entries.map((entry) => (entry.id === course.id ? entryOf(course) : entry))
+    };
+    localStorage.setItem(CABINET_KEY, JSON.stringify(cabinet));
     savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
+  }
+
+  function entryOf(value: Course): CabinetEntry {
+    return { id: value.id, seq: value.seq, title: value.title, className: value.className, updatedAt: value.updatedAt };
+  }
+
+  function blankCourse(seq: number): Course {
+    return {
+      id: `course-${Date.now()}-${seq}`,
+      seq,
+      title: '未命名课程',
+      className: '',
+      level: '启蒙一级',
+      ageRange: '5–6 岁',
+      objective: '',
+      updatedAt: new Date().toISOString(),
+      activities: [
+        {
+          id: `a-${Date.now()}`, type: '音素', title: '新的音素活动', content: '',
+          phonemes: [], dependencies: [], difficulty: 1,
+          prompt: '请输入教师提示语。', accessibility: '请描述视觉、听觉或键盘无障碍支持。',
+          duration: 8, feedback: ''
+        }
+      ],
+      versions: []
+    };
+  }
+
+  function loadCourseById(id: string): Course | null {
+    const raw = localStorage.getItem(courseStorageKey(id));
+    if (!raw) return null;
+    try {
+      return migrateCourse(JSON.parse(raw) as Course);
+    } catch {
+      return null;
+    }
+  }
+
+  function activateCourse(next: Course): void {
+    course = next;
+    cabinet = { ...cabinet, activeId: next.id };
+    history = [];
+    future = [];
+    selectedActivityId = next.activities[0]?.id ?? '';
+    compareBaseId = next.versions[0]?.id ?? '';
+    compareTargetId = next.versions.at(-1)?.id ?? '';
+  }
+
+  function switchCourse(id: string): void {
+    if (id === cabinet.activeId) return;
+    persist();
+    const next = loadCourseById(id);
+    if (!next) {
+      savedLabel = '未找到该课程的本地数据';
+      return;
+    }
+    activateCourse(next);
+    persist();
+    savedLabel = `已切换到 #${next.seq} · ${next.title}`;
+  }
+
+  function createCourse(): void {
+    persist();
+    const fresh = blankCourse(cabinet.nextSeq);
+    cabinet = { ...cabinet, nextSeq: cabinet.nextSeq + 1, entries: [...cabinet.entries, entryOf(fresh)] };
+    activateCourse(fresh);
+    persist();
+    savedLabel = `已新建课程 #${fresh.seq}`;
+  }
+
+  function duplicateCourse(id: string): void {
+    persist();
+    const source = id === cabinet.activeId ? structuredClone(course) : loadCourseById(id);
+    if (!source) {
+      savedLabel = '未找到要复制的课程';
+      return;
+    }
+    const copy = structuredClone(source);
+    copy.id = `course-${Date.now()}-${cabinet.nextSeq}`;
+    copy.seq = cabinet.nextSeq;
+    copy.updatedAt = new Date().toISOString();
+    cabinet = { ...cabinet, nextSeq: cabinet.nextSeq + 1, entries: [...cabinet.entries, entryOf(copy)] };
+    activateCourse(copy);
+    persist();
+    savedLabel = `已复制为课程 #${copy.seq}，原课程保持不变`;
+  }
+
+  function requestRemoveCourse(id: string): void {
+    removeTargetId = id;
+    removeNextId = cabinet.entries.find((entry) => entry.id !== id)?.id ?? '';
+    removeModalOpen = true;
+  }
+
+  function confirmRemoveCourse(): void {
+    const id = removeTargetId;
+    removeModalOpen = false;
+    if (!id) return;
+    const wasActive = id === cabinet.activeId;
+    let label = '课程已移除';
+    localStorage.removeItem(courseStorageKey(id));
+    cabinet = { ...cabinet, entries: cabinet.entries.filter((entry) => entry.id !== id) };
+    if (wasActive) {
+      const fallback = removeNextId ? loadCourseById(removeNextId) : null;
+      if (fallback) {
+        activateCourse(fallback);
+        label = `已移除，继续编辑 #${fallback.seq} · ${fallback.title}`;
+      } else {
+        const fresh = blankCourse(cabinet.nextSeq);
+        cabinet = { ...cabinet, nextSeq: cabinet.nextSeq + 1, entries: [...cabinet.entries, entryOf(fresh)] };
+        activateCourse(fresh);
+        label = '已移除，并新建空白课程继续编辑';
+      }
+    }
+    removeTargetId = '';
+    removeNextId = '';
+    persist();
+    savedLabel = label;
   }
 
   function undo(): void {
@@ -253,7 +439,7 @@
     persist();
   }
 
-  function updateCourse(field: 'title' | 'level' | 'ageRange' | 'objective', value: string): void {
+  function updateCourse(field: 'title' | 'className' | 'level' | 'ageRange' | 'objective', value: string): void {
     commit((draft) => { draft[field] = value; });
   }
 
@@ -363,23 +549,6 @@
     compareTargetId = latest?.id ?? '';
     if (!compareBaseId) compareBaseId = course.versions.at(-2)?.id ?? '';
     savedLabel = `版本 ${versionNumber} 已存档`;
-  }
-
-  function copyCourse(): void {
-    commit((draft) => {
-      const copy = structuredClone(draft);
-      copy.id = `course-${Date.now()}`;
-      copy.title = `${copy.title} · 副本`;
-      copy.versions = [];
-      copy.activities.forEach((activity) => {
-        activity.title = activity.title.replace('（副本）', '') + '（复制）';
-      });
-      draft.id = copy.id;
-      draft.title = copy.title;
-      draft.versions = copy.versions;
-      draft.activities = copy.activities;
-    });
-    savedLabel = '课程已复制为新草稿';
   }
 
   function focusIssue(issue: Diagnostic): void {
@@ -580,7 +749,7 @@
 
   <section class="course-hero">
     <div class="hero-copy">
-      <span class="kicker">COURSE BUILDER / {course.level}</span>
+      <span class="kicker">课程 #{course.seq} · {course.className || '未设置班级'} / {course.level}</span>
       <h2>{course.title}</h2>
       <p>{course.objective}</p>
     </div>
@@ -597,6 +766,7 @@
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'cabinet'} on:click={() => activeView = 'cabinet'}><span>05</span><b>课程资料柜</b><small>新建、复制、切换与移除</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -683,6 +853,7 @@
         <Tile class="compact-card">
           <span class="kicker">COURSE META</span><h3>课程信息</h3>
           <TextInput labelText="课程名称" value={course.title} on:input={(event) => updateCourse('title', readText(event))} />
+          <TextInput labelText="班级" value={course.className} on:input={(event) => updateCourse('className', readText(event))} />
           <TextInput labelText="课程等级" value={course.level} on:input={(event) => updateCourse('level', readText(event))} />
           <TextInput labelText="适用年龄" value={course.ageRange} on:input={(event) => updateCourse('ageRange', readText(event))} />
           <TextArea labelText="学习目标" rows={3} value={course.objective} on:input={(event) => updateCourse('objective', readText(event))} />
@@ -771,8 +942,8 @@
   {#if activeView === 'versions'}
     <main class="versions-view">
       <div class="view-heading">
-        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。</p></div>
-        <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
+        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程会在资料柜中生成一门独立课程，原课程保持不变；存档版本包含完整活动、依赖和教学说明。</p></div>
+        <div class="version-actions"><Button kind="tertiary" on:click={() => duplicateCourse(cabinet.activeId)}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
       </div>
       <div class="version-layout-svelte">
         <Tile class="version-timeline">
@@ -806,8 +977,72 @@
     </main>
   {/if}
 
+  {#if activeView === 'cabinet'}
+    <main class="cabinet-view">
+      <div class="view-heading">
+        <div>
+          <span class="kicker">COURSE CABINET</span>
+          <h2>课程资料柜</h2>
+          <p>每门课程独立保存活动、版本与离线内容；同名课程按编号区分，切换前会自动保留当前课程的修改。</p>
+        </div>
+        <Button kind="primary" on:click={createCourse}>新建课程</Button>
+      </div>
+      <div class="cabinet-grid">
+        {#each sortedEntries as entry (entry.id)}
+          <article class="cabinet-card" class:active={entry.id === cabinet.activeId}>
+            <header>
+              <span class="cabinet-seq">#{entry.seq}</span>
+              {#if entry.id === cabinet.activeId}<Tag type="green">正在编辑</Tag>{/if}
+            </header>
+            <h3>{entry.title}</h3>
+            <dl>
+              <div><dt>班级</dt><dd>{entry.className || '未设置'}</dd></div>
+              <div><dt>最后编辑</dt><dd>{formatTime(entry.updatedAt)}</dd></div>
+            </dl>
+            <div class="cabinet-actions">
+              {#if entry.id === cabinet.activeId}
+                <Button size="small" kind="ghost" disabled>编辑中</Button>
+              {:else}
+                <Button size="small" kind="tertiary" on:click={() => switchCourse(entry.id)}>切换</Button>
+              {/if}
+              <Button size="small" kind="ghost" on:click={() => duplicateCourse(entry.id)}>复制</Button>
+              <Button size="small" kind="danger-ghost" on:click={() => requestRemoveCourse(entry.id)}>移除</Button>
+            </div>
+          </article>
+        {/each}
+      </div>
+    </main>
+  {/if}
+
+  <Modal
+    bind:open={removeModalOpen}
+    danger
+    modalHeading="移除课程"
+    primaryButtonText={removePrimaryText}
+    secondaryButtonText="取消"
+    on:submit={confirmRemoveCourse}
+    on:click:button--secondary={() => (removeModalOpen = false)}
+  >
+    {#if removeTarget}
+      {#if removeTargetId === cabinet.activeId}
+        <p class="modal-copy">正在移除当前编辑的「#{removeTarget.seq} {removeTarget.title}」，其活动、版本与离线内容将从本机删除。请先选择要继续编辑的课程：</p>
+        {#if removeAlternatives.length}
+          <RadioButtonGroup legendText="继续编辑的课程" bind:selected={removeNextId}>
+            {#each removeAlternatives as entry (entry.id)}
+              <RadioButton value={entry.id} labelText={`#${entry.seq} · ${entry.title}（${entry.className || '未设置班级'}）`} />
+            {/each}
+          </RadioButtonGroup>
+        {:else}
+          <p class="modal-copy">资料柜中没有其他课程，移除后将自动新建一门空白课程继续编辑。</p>
+        {/if}
+      {:else}
+        <p class="modal-copy">确定移除「#{removeTarget.seq} {removeTarget.title}」吗？其活动、版本与离线内容将从本机删除；当前正在编辑的课程不受影响。</p>
+      {/if}
+    {/if}
+  </Modal>
+
   <footer class="app-footer">
-    <span>所有数据保存在当前浏览器 localStorage</span>
+    <span>每门课程独立保存在当前浏览器 localStorage，可离线编辑</span>
     <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Alt + N 新建活动 · Ctrl/Cmd + S 保存</span>
   </footer>
 </div>
